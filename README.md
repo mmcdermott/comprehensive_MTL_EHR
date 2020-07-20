@@ -1,4 +1,6 @@
-# A comprehensive evaluation of Multi-task learning on EHR timeseries
+# A Comprehensive Evaluation of Multi-task Learning on EHR Timeseries
+Source code for our paper (link forthcoming) examining multi-task learning on EHR timeseries data. For any questions, please contact `mmd@mit.edu`.
+
 # Install
 
 Set up the repository

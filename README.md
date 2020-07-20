@@ -1,5 +1,4 @@
-# Latent_Patient_Trajectories
-Latent patient trajectories from EHR data representation learning.
+# A comprehensive evaluation of Multi-task learning on EHR timeseries
 # Install
 
 Set up the repository

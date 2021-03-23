@@ -69,6 +69,8 @@ def add_time_since_measured(
     idx = pd.IndexSlice
     df = df.copy()
 
+    df.loc[:, idx[:, 'count']] = df.loc[:, idx[:, 'count']].fillna(0)
+
     is_absent = (df.loc[:, idx[:, 'count']] == 0).astype(int)
     hours_of_absence = is_absent.groupby(ID_COLS).cumsum()
     time_since_measured = hours_of_absence - hours_of_absence[is_absent==0].groupby(ID_COLS).fillna(method='ffill')

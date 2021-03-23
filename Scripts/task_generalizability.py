@@ -1,5 +1,5 @@
 import sys
-sys.path.append('../..')
+sys.path.append('../')
 
 import pickle
 from tqdm import tqdm

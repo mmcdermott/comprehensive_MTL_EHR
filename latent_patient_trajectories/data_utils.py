@@ -107,15 +107,56 @@ def filter_notes(notes_df):
     return notes_df
 
 def load_data(
-    datapath   = os.path.join(DATA_DIR, DATA_FILENAME),
-    fts_path   = os.path.join(DATA_DIR, FTS_FILENAME),
-    folds_path = os.path.join(DATA_DIR, FOLDS_FILENAME),
-    notes_path = os.path.join(DATA_DIR, NOTES_FILENAME),
-    load_numerics = True, load_treatments = True, load_codes = True,
-    criteria   = EXCLUSION_CRITERIA,
-    note_categories=[], load_first_n_notes=-1,
-    test_run = False,
+    datapath           = os.path.join(DATA_DIR, DATA_FILENAME),
+    fts_path           = os.path.join(DATA_DIR, FTS_FILENAME),
+    folds_path         = os.path.join(DATA_DIR, FOLDS_FILENAME),
+    notes_path         = os.path.join(DATA_DIR, NOTES_FILENAME),
+    load_numerics      = True, load_treatments = True, load_codes = True,
+    criteria           = EXCLUSION_CRITERIA,
+    note_categories    = [],
+    load_first_n_notes = -1,
+    test_run           = False,
+    eICU               = False,
+    return_immediately = True,
 ):
+    if eICU:
+        assert fts_path is None
+        assert notes_path is None
+
+        numerics_treatments = pd.read_hdf(
+            os.path.join(DATA_DIR, EICU_DATA_FILENAME), 'labs_vitals_treatments'
+        )
+        statics_df = pd.read_hdf(os.path.join(DATA_DIR, EICU_DATA_FILENAME), 'data_df')
+        if return_immediately: return statics_df, numerics_treatments
+
+        assert FOLD_IDX_LVL in numerics_treatments.index.names
+        assert FOLD_IDX_LVL in statics_df.index.names
+
+        if len(statics_df.index.names) < 2:
+            print("Correcting Index!")
+            statics_df.set_index(
+                [c for c in numerics_treatments.index.names if c != 'hours_in'], inplace=True
+            )
+
+        try:
+            # TODO(mmd): port this to filter_data function.
+            static_filtered = statics_df[
+                and_idxs([
+                    (statics_df[col] >= mn) for col, (mn, mx) in criteria.items() if mn is not None
+                ] + [
+                    (statics_df[col] <= mx) for col, (mn, mx) in criteria.items() if mx is not None
+                ])
+            ]
+            numerics_treatments_filtered = numerics_treatments[
+                numerics_treatments.index.get_level_values(ICUSTAY_ID).isin(
+                    static_filtered.index.get_level_values(ICUSTAY_ID)
+                )
+            ]
+
+            return static_filtered, numerics_treatments_filtered
+        except Exception as e:
+            print(e)
+            return statics_df, numerics_treatments
 
     if test_run:
         datapath = os.path.join(DATA_DIR, TEST_DATA_FILENAME)
@@ -173,7 +214,7 @@ def load_data(
 
     if folds_path is not None:
         with open(folds_path, mode='rb') as f: folds = pickle.load(f)
-        
+
         new_folds={}
         for i in range(len(folds)):
             new_folds.update({v: i for v in folds[i]}) # structure asserts that there are no repeats
@@ -181,63 +222,16 @@ def load_data(
         # test_time_old=time.time()
         for df in dfs:
             if df is None: continue
+            if FOLD_IDX_LVL in df.index.names: df.reset_index(level=FOLD_IDX_LVL, inplace=True)
+
             df.loc[:, FOLD_IDX_LVL] = [new_folds[s_i] for s_i in df.index.get_level_values(SUBJECT_ID)]
-        # print("\t\t add_folds first: {}".format(time.time()-test_time_old))
-        # test_time_old=time.time()
-        for df in dfs:
-            if df is None: continue
             df.set_index(FOLD_IDX_LVL, append=True, inplace=True)
         # print("\t\t add_folds reindex: {}".format(time.time()-test_time_old))
-
-                
 
     print("\t add_folds: {}".format(time.time()-time_old))
 
 
     return dfs
-
-def get_treatment_sequence(
-    df,
-    allowed_treatments = [],
-    min_T = 0,
-):
-    if type(allowed_treatments) is list: allowed_treatments = {t: (t, ) for t in allowed_treatments}
-
-    summarized_df = df[[]]
-    for new_col, old_cols in allowed_treatments.items():
-        c = (df[old_cols[0]] == 1)
-        for x in old_cols[1:]: c |= (df[x] == 1)
-
-        summarized_df[new_col] = c.astype(float)
-
-    summarized_df['Treatment Sequence'] = summarized_df.apply(lambda t: set(t[t == 1].index), axis=1)
-    summarized_df = summarized_df[['Treatment Sequence']]
-    if min_T > 0: summarized_df = summarized_df[summarized_df.index.get_level_values(DURATIONS_COL) > min_T]
-
-    summarized_df.sort_index(level=PATIENT_ID_COLS + [DURATIONS_COL])
-
-    unique_treatment_seq = summarized_df.groupby(PATIENT_ID_COLS).apply(lambda df: df[df.shift() != df]).dropna()
-
-    return unique_treatment_seq
-
-class fold_adder(object):
-    def __init__(self, folds, idx_col=SUBJECT_ID):
-        self.folds=folds
-        self.idx_col=idx_col
-    def __call__(self, df):
-        return self.add_folds_to_df(df)
-    def add_folds_to_df(self, i):
-        """
-        """
-        # folds are definatley unique because of dict
-        # total_set = set(df.index.get_level_values(self.idx_col))
-        # assert total_set.issubset(s_prev), "Folds should cover entirety of dataframe"
-        dfs[i].loc[:, FOLD_IDX_LVL] = [self.folds[s_i] for s_i in dfs[i].index.get_level_values(self.idx_col)]
-        dfs[i].set_index(FOLD_IDX_LVL, append=True, inplace=True)
-
-        return (dfs[i], i)
-
-
 
 def add_folds_to_df(df, folds, idx_col=SUBJECT_ID):
     any_overlap = False
@@ -261,9 +255,6 @@ def to_seq(x):
     try: return list(x)
     except TypeError as e: return [x]
 
-def f1(s):
-    return max(s, key=len)
-
 def get_splits(df, held_out_folds, tuning_evaluation_folds, K = 10):
     if type(held_out_folds) is not set: held_out_folds = set(to_seq(held_out_folds))
     if type(tuning_evaluation_folds) is not set: tuning_evaluation_folds = set(to_seq(tuning_evaluation_folds))
@@ -273,50 +264,6 @@ def get_splits(df, held_out_folds, tuning_evaluation_folds, K = 10):
     folds = df.index.get_level_values(FOLD_IDX_LVL)
     fold_sets = {'train': train_folds, 'tuning': tuning_evaluation_folds, 'held_out': held_out_folds}
     return {l: df[folds.isin(s)] for l, s in fold_sets.items()}
-
-def reformat_notes(notes, statics):
-    if NOTE_ID in notes.index.names: notes.index = notes.index.droplevel([NOTE_ID])
-    if 'description' in notes.index.names: notes.index = notes.index.droplevel(['description']) # this must be in bert notes
-
-    statics_idx = statics[[]].reset_index().set_index(ICUSTAY_ID).to_dict()
-    for col, dct in statics_idx.items():
-        if col not in notes.index.names:
-            notes[col] = [dct[i] for i in notes.index.get_level_values(ICUSTAY_ID)]
-            notes.set_index(col, append=True, inplace=True)
-
-
-    notes.index = notes.index.reorder_levels([
-        ICUSTAY_ID, SUBJECT_ID, HADM_ID, 'chartdate', 'charttime', 'category', FOLD_IDX_LVL
-    ])
-
-
-    notes = notes[
-        notes.index.get_level_values(SUBJECT_ID).isin(statics.index.get_level_values(SUBJECT_ID))
-    ]
-
-    notes = notes[notes.index.get_level_values('category').isin(['Nursing/other', 'Nursing'])]
-    notes.index = notes.index.droplevel(list(set(notes.index.names).intersection(set(['category','description']))))
-
-    times = notes[[]].reset_index()[['chartdate', 'charttime']].max(axis=1)
-    notes.index = notes.index.droplevel(['chartdate', 'charttime'])
-    times.index = notes.index
-
-    times = pd.DataFrame(times).join(statics[['intime']], on=PATIENT_ID_COLS + [FOLD_IDX_LVL])
-    hours_in = (times[0] - times.intime).dt.round('H') / pd.Timedelta('1 hour')
-    hours_in = hours_in.astype(int)
-    notes[DURATIONS_COL] = hours_in
-
-    notes.set_index(DURATIONS_COL, append=True, inplace=True)
-        
-    if 'text' in notes:
-        notes = notes.groupby(notes.index.names).agg({'text': f1})
-    else:
-        notes = notes.groupby(notes.index.names).mean()
-        notes.columns = pd.MultiIndex.from_tuples(
-            [('Topic %d' % x, 'mean') for x in notes.columns], names = ('LEVEL2', 'Aggregation Function')
-        )
-
-    return notes
 
 def prepare_continuous_labels(numerics, statics):
     """

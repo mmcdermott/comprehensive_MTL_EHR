@@ -99,9 +99,11 @@ class RollingTimedStaticEventsExtractor(Extractor):
         self.err_early       = err_early
 
     def __get_time_vals(self, df, col, is_begin):
-        if type(col) is str:             return df[col]
-        elif is_begin == self.err_early: return df[list(col)].max(axis=1)
-        else:                            return df[list(col)].min(axis=1)
+        if type(col) is str:             vals = df[col]
+        elif is_begin == self.err_early: vals = df[list(col)].max(axis=1)
+        else:                            vals = df[list(col)].min(axis=1)
+
+        return vals
 
     def _fit(self, dfs):
         statics = dfs[0]
@@ -137,8 +139,8 @@ class RollingTimedStaticEventsExtractor(Extractor):
     def _extract(self, dfs):
         statics = dfs[0].copy()
 
-        # treatments has the right schema, but we don't need any of its data.
-        out_df = dfs[2][[]].copy()
+        # numerics has the right schema, but we don't need any of its data.
+        out_df = dfs[1][[]].copy()
 
         # I compute the start time pre-join to avoid doing unnecessary work.
         statics[self.START_TIME_COL] = self.__get_time_vals(
@@ -155,6 +157,10 @@ class RollingTimedStaticEventsExtractor(Extractor):
             if time_col in duration_cols: at_duration_col = duration_cols[time_col]
             else:
                 at_duration_col = self.__get_time_vals(out_df, time_col, is_begin=False) - start_time
+
+                if at_duration_col.dtype is not pd.to_timedelta([3,4], unit='hour').dtype:
+                    at_duration_col = pd.to_timedelta(at_duration_col, unit='hour')
+
                 duration_cols[time_col] = at_duration_col
 
             if window is None:
@@ -242,11 +248,11 @@ class DemographicFeaturizer(Extractor):
 
     def _fit(self, dfs):
         statics = self.__correct(dfs[0].copy())
-
         self.means = statics[self.continuous_columns].mean(axis=0)
+
         self.stds = statics[self.continuous_columns].std(axis=0)
 
-        self.vocab = {c: [UNK] + list(sorted(set(statics[c]))) for c in self.categorical_columns}
+        self.vocab = {c: [UNK] + list(sorted(set(statics[c]) - {UNK,})) for c in self.categorical_columns}
         self.vocab_map = {c: {k: i for i, k in enumerate(v)} for c, v in self.vocab.items()}
 
         # # narrow down ethnicities to 5 bins
@@ -300,8 +306,8 @@ class EOLCareTSFeaturizer(RollingTimedStaticEventsExtractor):
         self,
         columns = {
             # TASK NAME                  INITIAL_VAL, TIME_AT_ON
-            'DNR Ordered':              ('dnr_first', 'timednr_chart'),
-            'Comfort Measures Ordered': ('cmo_first', ('timecmo_chart', 'timecmo_nursingnote')),
+            'DNR Ordered':              ('dnr_first', 'dnr_first_charttime'),
+            'Comfort Measures Ordered': ('cmo_first', 'timecmo_chart'),
         },
         **base_class_kwargs,
     ):
@@ -398,16 +404,18 @@ class DeathLabels(enum.Enum):
     WITHIN_1_YEAR              = enum.auto()
 
 class StaticAcuityOutcomeExtractor(Extractor):
-    DISCHARGE_LOCATIONS_TO_EXCLUDE = {'DEAD/EXPIRED'}
+    DISCHARGE_LOCATIONS_TO_EXCLUDE = {'DEAD/EXPIRED', 'Death'}
     # TODO: constant
     def __init__(
         self,
         name='Final Acuity Outcome',
+        eicu=False,
         **base_class_kwargs,
     ):
         super().__init__(**base_class_kwargs)
         self.name = name
         self.columns = {name: FeatureTypes.CATEGORICAL}
+        self.eicu = eicu
 
     def _fit(self, dfs):
         statics = dfs[0]
@@ -417,12 +425,13 @@ class StaticAcuityOutcomeExtractor(Extractor):
         self.vocab = [dl for dl in self.vocab if dl not in self.DISCHARGE_LOCATIONS_TO_EXCLUDE]
         self.vocab += [x.name for x in DeathLabels]
         self.vocab_map = {k: i for i, k in enumerate(self.vocab)}
-        self.vocab_map['unknown'] = 10
+        self.vocab_map['unknown'] = len(self.vocab_map)
 
     def _extract_row(self, r):
         if r.discharge_location in self.vocab_map: return self.vocab_map[r.discharge_location]
         elif r.mort_icu  == 1:                     return self.vocab_map[DeathLabels.IN_ICU.name]
-        elif r.hospital_expire_flag == 1:          return self.vocab_map[DeathLabels.IN_HOSPITAL.name]
+        elif self.eicu and r.mort_hosp == 1:       return self.vocab_map[DeathLabels.IN_HOSPITAL.name]
+        elif (not self.eicu) and r.hospital_expire_flag == 1: return self.vocab_map[DeathLabels.IN_HOSPITAL.name]
         else: return np.NaN
 
     def _extract(self, dfs):
@@ -510,10 +519,10 @@ class RollingAcuityEventsExtractor(RollingTimedStaticEventsExtractor):
             # TASK:      (INIT, TIME_COL,        WINDOW,  GAP,                 EXCLUSION_FN,   VALUE_NUM/COL
             'mort_24h':  (0,    'deathtime',     days(1), hrs(2),              None,                       1),
             'mort_48h':  (0,    'deathtime',     days(2), hrs(6),              None,                       1),
-            'dnr_24h':   (0,    'timednr_chart', days(1), (hrs(2), days(1e3)), lambda x: x.dnr_first == 1, 1),
-            'dnr_48h':   (0,    'timednr_chart', days(2), (hrs(6), days(1e3)), lambda x: x.dnr_first == 1, 1),
-            'cmo_24h':   (0,    ('timecmo_chart', 'timecmo_nursingnote'), days(1), hrs(2), None, 1),
-            'cmo_48h':   (0,    ('timecmo_chart', 'timecmo_nursingnote'), days(2), hrs(6), None, 1),
+            'dnr_24h':   (0,    'dnr_first_charttime', days(1), (hrs(2), days(1e3)), lambda x: x.dnr_first == 1, 1),
+            'dnr_48h':   (0,    'dnr_first_charttime', days(2), (hrs(6), days(1e3)), lambda x: x.dnr_first == 1, 1),
+            'cmo_24h':   (0,    'timecmo_chart', days(1), hrs(2), None, 1),
+            'cmo_48h':   (0,    'timecmo_chart', days(2), hrs(6), None, 1),
             'disch_24h': (
                 'NO_DISCH', ('outtime', 'dischtime'), days(1), hrs(2), lambda x: x.hospital_expire_flag == 1,
                 'discharge_location',

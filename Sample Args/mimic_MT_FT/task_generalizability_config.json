@@ -1,0 +1,5 @@
+{
+ "gpus_per_model": 1,
+ "models_per_gpu": 1,
+ "gpus": [0, 0, 0, 1, 1, 2, 2, 3, 3, 3]
+ }

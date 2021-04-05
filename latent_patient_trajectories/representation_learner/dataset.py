@@ -11,7 +11,7 @@ from ..constants import *
 from .utils import *
 from ..utils import *
 from .extractors import *
-from ..data_utils import convert_notes_to_features_eff, convert_notes_to_features_bret, reformat_notes, prepare_continuous_labels, tokenize_notes
+from ..data_utils import prepare_continuous_labels, tokenize_notes
 from ..BERT.constants import *
 from ..BERT.data_processor import *
 from pytorch_pretrained_bert.tokenization import BertTokenizer
@@ -805,20 +805,7 @@ class PatientDataset(Dataset):
 
         # Notes
         if self.using_integrated_notes:
-            note_ids,note_masks,note_segment_ids,note_hours_idx,note_hours_num=convert_notes_to_features_eff(
-                dfs['notes'], input_seq_length=self.max_note_len, seq_len=self.max_seq_len,
-                tokenizer=self.tokenizer
-            )
-
-            np_arrays['note_ids'] = np.expand_dims(note_ids, axis=0)
-            np_arrays['note_masks'] = np.expand_dims(note_masks, axis=0)
-            np_arrays['note_segment_ids'] = np.expand_dims(note_segment_ids, axis=0)
-            np_arrays['note_hours_idx'] = np.expand_dims(note_hours_idx, axis=0)
-            np_arrays['note_hours_num'] = np.expand_dims(note_hours_num, axis=0)
-
-            np_arrays['note_ids'][np.isnan(np_arrays['note_ids'])]=0
-            np_arrays['note_masks'][np.isnan(np_arrays['note_masks'])]=0
-            np_arrays['note_segment_ids'][np.isnan(np_arrays['note_segment_ids'])]=0
+            raise NotImplementedError("Doesn't support notes at present.")
 
         tensors = {}
         for k, arr in np_arrays.items():

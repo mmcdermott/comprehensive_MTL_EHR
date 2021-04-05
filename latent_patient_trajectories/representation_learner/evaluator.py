@@ -25,7 +25,6 @@ from ..data_utils import *
 from ..BERT.model import *
 from ..BERT.constants import *
 
-from .adapted_model import SelfAttentionTimeseries
 from .args import *
 from .meta_model import *
 

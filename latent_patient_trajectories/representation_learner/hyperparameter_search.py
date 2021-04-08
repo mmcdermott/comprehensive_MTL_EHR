@@ -1,17 +1,20 @@
 # Generic Imports
-import copy, math, itertools, json, os, shutil, time
+import copy, math, itertools, json, os, shutil, time, traceback
 import matplotlib.pyplot as plt
 
-from hyperopt import fmin, hp, pyll, tpe, STATUS_OK, STATUS_FAIL, Trials
+from datetime import datetime
+
+from hyperopt import fmin, hp, pyll, tpe, rand, STATUS_OK, STATUS_FAIL, Trials
 from hyperopt.mongoexp import MongoTrials
 from tqdm import tqdm
 
 # LPT Imports
-from . import run_model
+from . import run_model, evaluator
 
+from ..utils import *
 from ..constants import *
 from .args import *
-from .evaluator import *
+import traceback
 
 def null_and_raise(*args, **kwargs):
     raise NotImplementedError("This shouldn't be called..." + str(args) + str(kwargs))
@@ -27,11 +30,13 @@ HP_METHODS = {
 }
 HP_ALGS = {
     'tpe.suggest': tpe.suggest,
+    'rand.suggest': rand.suggest,
 }
 
 def update_perf_metrics(hyperparameter_search_dir, dataset, tqdm=None):
     rotations = set(x for x in os.listdir(hyperparameter_search_dir)).intersection(set(str(i) for i in range(10)))
-    print("Observe runs for rotations: %s" % ', '.join(rotations))
+    if tqdm is not None:
+        print("Observe runs for rotations: %s" % ', '.join(rotations))
 
     binary_multilabel_tasks = dataset.get_binary_multilabel_keys()
     next_timepoint_was_measured_tasks = dataset.dfs['next_timepoint_was_measured'].columns
@@ -62,7 +67,9 @@ def update_perf_metrics(hyperparameter_search_dir, dataset, tqdm=None):
 
             tuning_perf_metrics = []
             for task_performance in tuning_task_info:
-                perf_metrics = get_performance_metrics(task_performance, all_vocabs=dataset.all_vocabs)
+                perf_metrics = evaluator.get_performance_metrics(
+                    task_performance, all_vocabs=dataset.all_vocabs
+                )
 
                 for k, v in perf_metrics.items():
                     if k[0] == 'next_timepoint' and k[1].endswith('all)'):
@@ -88,7 +95,9 @@ def update_perf_metrics(hyperparameter_search_dir, dataset, tqdm=None):
 
             test_perf_metrics = []
             for task_performance in test_task_info:
-                perf_metrics = get_performance_metrics(task_performance, all_vocabs=dataset.all_vocabs)
+                perf_metrics = evaluator.get_performance_metrics(
+                    task_performance, all_vocabs=dataset.all_vocabs
+                )
 
                 for k, v in perf_metrics.items():
                     if k[0] == 'next_timepoint' and k[1].endswith('all)'):
@@ -164,19 +173,27 @@ def merge_dicts(*dicts):
 def get_errors(analysis_dirs):
     return merge_dicts(*(get_errors_single(d) for d in analysis_dirs))
 
-def get_errors_single(analysis_dir):
+def get_errors_single(analysis_dir, results_dict = None):
+    if results_dict is None: results_dict = {}
+
     subdirs = os.listdir(analysis_dir)
-    errors = {}
     for rotation in range(10):
         rotation = str(rotation)
         if rotation not in subdirs: continue
+        if rotation not in results_dict: results_dict[rotation] = {}
         rotation_dir = os.path.join(analysis_dir, rotation)
-        errors[rotation] = {}
 
         for run_name in os.listdir(rotation_dir):
             run_dir = os.path.join(rotation_dir, run_name)
             error_filepath = os.path.join(run_dir, 'error.pkl')
-            if not os.path.isfile(os.path.join(run_dir, 'error.pkl')): continue
+
+            if not os.path.isfile(error_filepath):
+                if run_name in results_dict[rotation]:
+                    print(f"Have error that's not present! {error_filepath}")
+                    results_dict[rotation].pop(run_name)
+                continue
+            elif run_name in results_dict[rotation]: continue
+
             error_time = datetime.fromtimestamp(os.path.getmtime(error_filepath))
 
             try:
@@ -197,11 +214,11 @@ def get_errors_single(analysis_dir):
                     ))
                 else: args, completed_training = None, None
 
-                errors[rotation][run_name] = (error, error_time, completed_training, raw_params, args)
+                results_dict[rotation][run_name] = (error, error_time, completed_training, raw_params, args)
             except Exception as e:
-                print("Can't parse errors!", e)
-                errors[rotation][run_name] = (True, error_time, None, None, None)
-    return errors
+                print(f"Can't parse errors for {error_filepath}: {e}")
+                results_dict[rotation][run_name] = (True, error_time, None, None, None)
+    return results_dict
 
 def read_many_dirs(search_dirs, **kwargs):
     all_configs, all_results, all_args, all_params, all_trials = {}, [], [], [], None
@@ -224,67 +241,81 @@ def read_many_dirs(search_dirs, **kwargs):
     return all_configs,merge_dicts(*all_results),merge_dicts(*all_args),merge_dicts(*all_params),all_trials
 
 def read_or_recreate_trials(
-    hyperparameter_search_dir, tuning_dataset=None, test_dataset=None, tqdm=None, overwrite=False
+    hyperparameter_search_dir, tuning_dataset=None, test_dataset=None, tqdm=None, overwrite=False,
+    do_print=True,
+    trials_out_dict = None,
+    results_out_dict = None,
+    args_out_dict = None,
+    params_out_dict = None,
 ):
     config = read_config(hyperparameter_search_dir)[0]
+    hyperparameter_search_args = HyperparameterSearchArgs.from_json_file(os.path.join(
+        hyperparameter_search_dir, HYPERPARAMETER_SEARCH_ARGS_FILENAME
+    ))
 
     filepath = os.path.join(hyperparameter_search_dir, HYP_CONFIG_FILENAME)
     with open(filepath, mode='r') as f: raw_config = json.loads(f.read())
 
     rotations = set(x for x in os.listdir(hyperparameter_search_dir)).intersection(set(str(i) for i in range(10)))
-    print("Observe runs for rotations: %s" % ', '.join(rotations))
+    if do_print: print("Observe runs for rotations: %s" % ', '.join(rotations))
 
-    all_trials  = {}
-    all_results = {}
-    all_args    = {}
-    all_params = {}
+    if trials_out_dict is None: trials_out_dict  = {}
+    if results_out_dict is None: results_out_dict = {}
+    if args_out_dict is None: args_out_dict    = {}
+    if params_out_dict is None: params_out_dict  = {}
 
-    rotations_rng = rotations if len(rotations) < 4 or tqdm is None else tqdm(rotations)
+    if len(rotations) < 4 or tqdm is None: rotations_rng = rotations
+    else: rotations_rng = tqdm(rotations, desc="Reading Rotations")
     for rotation in rotations_rng:
-        rotation_results = {}
-        rotation_args = {}
-        rotation_params = {}
+        for d in (results_out_dict, args_out_dict, params_out_dict):
+            if rotation not in d: d[rotation] = {}
+
+        rotation_results = results_out_dict[rotation]
+        rotation_args    = args_out_dict[rotation]
+        rotation_params  = params_out_dict[rotation]
 
         rotation_dir = os.path.join(hyperparameter_search_dir, rotation)
 
         run_names = [r for r in os.listdir(rotation_dir) if r != 'trials.pkl']
-        run_names_rng = run_names if tqdm is None else tqdm(run_names)
+        run_names_rng = run_names if tqdm is None else tqdm(run_names, desc="Reading Runs")
 
-        for run_name in run_names:
+        for run_name in run_names_rng:
             run_dir = os.path.join(rotation_dir, run_name)
             if not os.path.isdir(run_dir):
-                print(run_dir)
+                print(f"Found file; expecting directory! {run_dir})")
+                continue
+            elif os.path.isfile(os.path.join(run_dir, 'error.pkl')):
                 continue
 
-            if os.path.isfile(os.path.join(run_dir, 'error.pkl')): continue
+            # Lastly, if we don't need results, continue
+            if run_name in rotation_results and rotation_results[run_name] is not None: continue
 
             args_filepath = os.path.join(run_dir, ARGS_FILENAME)
             if not os.path.isfile(args_filepath): continue
             args = Args.from_json_file(args_filepath)
-            rotation_args[run_name] = args
-
-            params_filepath = os.path.join(run_dir, PARAMS_FILENAME)
-            if os.path.isfile(params_filepath):
-                with open(params_filepath, mode='rb') as f: rotation_params[run_name] = pickle.load(f)
-            else:
-                rotation_params[run_name] = args_to_params(rotation_args[run_name], raw_config)
 
             num_epochs = args.epochs
             completed_training = os.path.isfile(os.path.join(run_dir, 'model.epoch-%d' % (num_epochs - 1)))
             if not completed_training:
-                print("Run %s Still training (or errored and didn't report)" % run_name)
+                print(f"Run {run_dir} still training (or errored and didn't report)")
                 continue
 
-            tuning_result_filepath = os.path.join(run_dir, 'tuning_perf_metrics.pkl')
+            tuning_result_filepath = os.path.join(run_dir, 'tuning_perf.pkl')
             if os.path.isfile(tuning_result_filepath):
                 with open(tuning_result_filepath, mode='rb') as f:
                     tuning = pickle.load(f)
+            elif os.path.isfile(os.path.join(run_dir, 'tuning_perf_metrics.pkl')):
+                with open(os.path.join(run_dir, 'tuning_perf_metrics.pkl'), mode='rb') as f:
+                    tuning = pickle.load(f)
             else:
-                print('Missing tuning for %s' % run_name)
+                print(f'Missing tuning for {run_dir}')
                 if tuning_dataset is not None:
-                    _, _, tuning = evaluate_multi(
-                        tuning_dataset, model_rundir=run_dir, num_random_endpoints=10, batch_size=1024, num_workers=27,
-                        evaluate_on_25=True, get_all_reprs=False, tqdm=tqdm
+                    # set the necessary features in tuning dataset
+                    if args.do_masked_imputation:
+                        tuning_dataset.imputation_mask_rate=args.imputation_mask_rate
+                    _, _, tuning = evaluator.evaluate_multi(
+                        tuning_dataset, model_rundir=run_dir, num_random_endpoints=10, batch_size=1024,
+                        num_workers=27, evaluate_on_25=True, get_all_reprs=False, tqdm=tqdm
                     )
                     with open(tuning_result_filepath, mode='wb') as f:
                         pickle.dump(tuning, f)
@@ -292,30 +323,44 @@ def read_or_recreate_trials(
                     print("Wasn't given a tuning dataset!")
                     continue
 
-            test_result_filepath = os.path.join(run_dir, 'test_perf_metrics.pkl')
+            test_result_filepath = os.path.join(run_dir, 'test_perf.pkl')
             if os.path.isfile(test_result_filepath):
                 with open(test_result_filepath, mode='rb') as f:
                     test = pickle.load(f)
+            elif os.path.isfile(os.path.join(run_dir, 'test_perf_metrics.pkl')):
+                with open(os.path.join(run_dir, 'test_perf_metrics.pkl'), mode='rb') as f:
+                    test = pickle.load(f)
             else:
-                print('Have tuning but missing test for %s' % run_name)
+                print(f"Have tuning but missing test for {run_dir}/{run_name}")
+                test = None
                 if test_dataset is not None:
-                    _, _, test = evaluate_multi(
-                        test_dataset, model_rundir=run_dir, num_random_endpoints=10, batch_size=1024, num_workers=27,
-                        evaluate_on_25=True, get_all_reprs=False, tqdm=tqdm
+                    if args.do_masked_imputation:
+                        test_dataset.imputation_mask_rate=args.imputation_mask_rate
+                    _, _, test = evaluator.evaluate_multi(
+                        test_dataset, model_rundir=run_dir, num_random_endpoints=10, batch_size=1024,
+                        num_workers=27, evaluate_on_25=True, get_all_reprs=False, tqdm=tqdm
                     )
                     with open(test_result_filepath, mode='wb') as f:
                         pickle.dump(test, f)
                 else:  "Wasn't given a test dataset!"
 
             rotation_results[run_name] = (tuning, test)
+            if run_name not in rotation_args or rotation_args[run_name] is None:
+                rotation_args[run_name] = args
 
-        all_results[rotation] = rotation_results
-        all_args[rotation] = rotation_args
-        all_params[rotation] = rotation_params
+            if run_name not in rotation_params or rotation_params[run_name] is None:
+                params_filepath = os.path.join(run_dir, PARAMS_FILENAME)
+                if os.path.isfile(params_filepath):
+                    with open(params_filepath, mode='rb') as f: rotation_params[run_name] = pickle.load(f)
+                else:
+                    rotation_params[run_name] = args_to_params(rotation_args[run_name], raw_config)
+
+
+        if rotation in trials_out_dict and trials_out_dict[rotation] is not None: continue
 
         trials_filepath = os.path.join(rotation_dir, 'trials.pkl')
         if os.path.exists(trials_filepath) and not overwrite:
-            with open(trials_filepath, mode='rb') as f: all_trials[rotation] = pickle.load(f)
+            with open(trials_filepath, mode='rb') as f: trials_out_dict[rotation] = pickle.load(f)
             continue
 
         # Rebuild Trials
@@ -325,14 +370,38 @@ def read_or_recreate_trials(
             args = rotation_args[run_name]
             params = rotation_params[run_name]
             perf_metrics, test_perf_metrics = rotation_results[run_name]
-            tuning_scores = -pd.Series(ObjectiveFntr.perf_metrics_to_trial_result(perf_metrics))
-            test_scores = -pd.Series(ObjectiveFntr.perf_metrics_to_trial_result(test_perf_metrics))
+            try:
+                loss = ObjectiveFntr.perf_metrics_to_trial_result(
+                    perf_metrics, args, single_task=hyperparameter_search_args.single_task_search
+                )
+            except Exception as e:
+                print(
+                    f"Errored computing tuning results for {hyperparameter_search_dir} on rotation "
+                    f"{rotation}, {run_name}: {e}"
+                )
+                traceback.print_exc()
+                continue
 
-            loss = tuning_scores.mean()
-            loss_variance = tuning_scores.std()**2
-            test_loss = test_scores.mean()
-            test_loss_variance = test_scores.std()**2
+            try:
+                if test_perf_metrics is not None:
+                    test_loss = ObjectiveFntr.perf_metrics_to_trial_result(
+                        test_perf_metrics, args, single_task=hyperparameter_search_args.single_task_search
+                    )
+                else: test_loss = np.NaN
+            except TypeError as e:
+                test_loss = np.NaN
+            except Exception as e:
+                if "'NoneType' object is not subscriptable" in str(e): 
+                    test_loss = np.NaN
+                else:
+                    print(
+                        f"Errored computing test results for {hyperparameter_search_dir} on rotation {rotation}, "
+                        f"{run_name}: {e}"
+                    )
+                    traceback.print_exc()
+                    continue
 
+            loss_variance, test_loss_variance = np.NaN, np.NaN
             result = {
                 'status': STATUS_OK,
                 'loss': loss,
@@ -359,9 +428,9 @@ def read_or_recreate_trials(
                 'exp_key': 'exp',# hyperparameter_search_dir,
             })
         trials.refresh()
-        all_trials[rotation] = trials
+        trials_out_dict[rotation] = trials
 
-    return config, all_results, all_args, all_params, all_trials
+    return config, results_out_dict, args_out_dict, params_out_dict, trials_out_dict
 
 def read_config(search_dir):
     """
@@ -439,7 +508,7 @@ def flatten_samples(samples):
 
     N = len(samples[nested_keys[0]])
     keys_to_add = set(nested_keys)
-    for k in nested_keys: 
+    for k in nested_keys:
         for i in range(N): keys_to_add.update(samples[k][i][1].keys())
     for k in keys_to_add: new_samples[k] = [np.NaN for _ in range(N)]
 
@@ -449,7 +518,7 @@ def flatten_samples(samples):
             new_samples[k][i] = s
             for k2, v2 in v.items(): new_samples[k2][i] = v2
 
-    for k, v in new_samples.items():
+    for k, v in list(new_samples.items()):
         if len(set(v)) == 1: new_samples.pop(k)
 
     return new_samples
@@ -522,7 +591,7 @@ def resolve(params):
         params.update(model_specific_params)
 
     params = {k: int(v) if k in INT_PARAMS else v for k, v in params.items()}
-    
+
 
     # TODO(mmd): get rid of unnecessary projection.
     if 'hidden_size_multiplier' in params:
@@ -574,94 +643,28 @@ def resolve(params):
 
 class ObjectiveFntr:
     def __init__(
-        self, base_dir, rotation, constant_params, tqdm, single_task="", do_match_train_windows=True
+        self, base_dir, rotation, constant_params, tqdm, single_task="", do_match_train_windows=True,
+        do_eicu = False
     ):
         self.base_dir = base_dir
         self.rotation = rotation
         self.constant_params = copy.copy(constant_params)
         self.single_task = single_task
         self.do_match_train_windows = do_match_train_windows
-        if self.single_task: assert self.single_task in ABLATION_GROUPS
+        self.do_eicu = do_eicu
+        if self.single_task: assert self.single_task in list(ABLATION_GROUPS.keys())+['masked_imputation']
 
         self.tqdm = tqdm
 
     @staticmethod
-    def perf_metrics_to_trial_result(perf_metrics):
-        if len(perf_metrics) == 2:
-            perf_metrics_all_time, perf_metrics_25 = perf_metrics
-            perf_metrics_till_discharge = None
-        else:
-            perf_metrics_all_time, perf_metrics_25, perf_metrics_till_discharge = perf_metrics
+    def perf_metrics_to_trial_result(perf_metrics, args, single_task=None):
+        # TODO(mmd): This shouldn't be a staticmethod really.
+        if single_task: assert single_task in list(ABLATION_GROUPS.keys())+['masked_imputation']
 
-        assert not (
-            (perf_metrics_all_time is None) and (perf_metrics_25 is None) and
-            (perf_metrics_till_discharge is None)
-        ), "Can't all be none!"
-
-        # TODO(mmd): operationalize
-        per_task_scores = {}
-        rolling_multilabel_aucs = [
-            'mort_24h', 'mort_48h', 'dnr_24h', 'dnr_48h', 'cmo_24h', 'cmo_48h',
-        ]
-        for task in rolling_multilabel_aucs:
-            if not perf_metrics_all_time: continue
-            per_task_scores[task] = perf_metrics_all_time[('tasks_binary_multilabel', 'AUROC (all)')][task]
-
-        rolling_multiclass_aucs = ['disch_24h', 'disch_48h', 'rolling_fts']
-        for task in rolling_multiclass_aucs:
-            if not perf_metrics_all_time: continue
-            per_task_scores.update({
-                '%s - %s' % (task, k): v for k, v in perf_metrics_all_time[
-                    (task, 'AUROC (ovr; all)')
-                ].to_dict().items()
-            })
-
-        static_multilabel_aucs = [
-            'icd_infection', 'icd_neoplasms', 'icd_endocrine', 'icd_blood', 'icd_mental', 'icd_nervous',
-            'icd_circulatory', 'icd_respiratory', 'icd_digestive', 'icd_genitourinary', 'icd_pregnancy',
-            'icd_skin', 'icd_musculoskeletal', 'icd_congenital', 'icd_perinatal', 'icd_ill_defined',
-            'icd_injury', 'icd_unknown',
-        ]
-        for task in static_multilabel_aucs:
-            if not perf_metrics_25: continue
-
-            # TODO: Why this conditional?
-            if task in per_task_scores.keys():
-                per_task_scores[task] = perf_metrics_25[('tasks_binary_multilabel', 'AUROC (all)')][task]
-            else:
-                per_task_scores[task]=0.5
-
-        evaluate_till_discharge_multilabel_aucs = ['Readmission 30']
-        for task in evaluate_till_discharge_multilabel_aucs:
-            if not perf_metrics_till_discharge: continue
-            if task in per_task_scores.keys():
-                per_task_scores[task] = perf_metrics_till_discharge[
-                    ('tasks_binary_multilabel', 'AUROC (all)')
-                ][task]
-            else:
-                per_task_scores[task]=0.5
-
-        static_multiclass_aucs = ['Final Acuity Outcome']
-        for task in static_multiclass_aucs:
-            if not perf_metrics_25: continue
-            per_task_scores.update({
-                '%s - %s' % (task, k): v for k, v in perf_metrics_25[
-                    (task, 'AUROC (ovr; all)')
-                ].to_dict().items()
-            })
-
-        if perf_metrics_all_time:
-            per_task_scores.update({
-                'next_timepoint_was_measured - %s' % k[0]: v for k, v in \
-                    perf_metrics_all_time[('next_timepoint_was_measured', 'AUROC (all)')].to_dict().items()
-            })
-
-            per_task_scores.update({
-                'next_timepoint - %s' % k[0]: v for k, v in \
-                    (2**(perf_metrics_all_time[('next_timepoint', 'R2 (all)')] - 1)).to_dict().items()
-            })
-
-        return per_task_scores
+        m = evaluator.get_manuscript_metrics_via_args(perf_metrics, args, metric='AUROC')
+        if not single_task: return -m.mean()
+        elif single_task == 'masked_imputation': return -m[['MIR', 'MIC']].mean()
+        else: return -m[ABLATIONS_TO_REPORTING_MAP[single_task]]
 
     def __call__(self, params):
         base_dir = self.base_dir
@@ -685,68 +688,59 @@ class ObjectiveFntr:
             if 'regression_task_weight' in args_dict: del(args_dict['regression_task_weight'])
             if 'task_weights_filepath' in args_dict: del(args_dict['task_weights_filepath'])
             args_dict['ablate'] = [k for k in ABLATION_GROUPS.keys() if k != self.single_task]
+            # TODO(mmd): Improve interface
+            if self.single_task == 'next_timepoint_info':
+                # Here, we also want to ablate out the regression task, so we add that in manually...
+                args_dict['ablate'].append('next_timepoint')
 
             if self.do_match_train_windows:
-                args_dict['set_to_eval_mode'] = EVAL_MODES_BY_ABLATION_GROUPS[self.single_task]
+                args_dict['set_to_eval_mode'] = EVAL_MODES_BY_ABLATION_GROUPS[self.single_task] if self.single_task in EVAL_MODES_BY_ABLATION_GROUPS.keys() else 'all_time'
 
         args = Args(**args_dict)
+        if self.do_eicu: assert args.do_eicu
+
+        if self.single_task:
+            if 'regression_task_weight' in args_dict: del(args_dict['regression_task_weight'])
+            if 'task_weights_filepath' in args_dict: del(args_dict['task_weights_filepath'])
+
+        eval_args = EvalArgs(
+            run_dir = args.run_dir,
+            notes = args.notes,
+            rotation = args.rotation,
+            do_eicu = args.do_eicu,
+            do_save_all_reprs = False,
+            do_eval_train = False,
+            do_eval_tuning = True,
+            do_eval_test = True,
+            num_dataloader_workers = args.num_dataloader_workers,
+            do_masked_imputation = args.do_masked_imputation,
+            imputation_mask_rate = args.imputation_mask_rate,
+        )
 
         try:
             trained_meta_model = run_model.main(args, tqdm)
+            eval_out = evaluator.main(eval_args, tqdm, model=trained_meta_model)
 
-            with open(
-                os.path.join(ROTATIONS_DIR, args.notes, str(rotation), 'tuning_dataset.pkl'), mode='rb'
-            ) as f:
-                tuning_dataset = pickle.load(f)
-
-            _, task_info, perf_metrics = evaluate_multi(
-                tuning_dataset, model=trained_meta_model, n_gpu=trained_meta_model.n_gpu,
-                get_all_reprs = False, batch_size=2*args.batch_size, tqdm=tqdm, num_workers=28,
-                args=args
+            loss = ObjectiveFntr.perf_metrics_to_trial_result(
+                eval_out['tuning'][-1], args, single_task=self.single_task
+            )
+            test_loss = ObjectiveFntr.perf_metrics_to_trial_result(
+                eval_out['test'][-1], args, single_task=self.single_task
             )
 
-            with open(os.path.join(args.run_dir, 'tuning_task_info.pkl'), mode='wb') as f:
-                pickle.dump(task_info, f)
-            with open(os.path.join(args.run_dir, 'tuning_perf_metrics.pkl'), mode='wb') as f:
-                pickle.dump(perf_metrics, f)
-
-            with open(
-                os.path.join(ROTATIONS_DIR, args.notes, str(rotation), 'test_dataset.pkl'), mode='rb'
-            ) as f:
-                test_dataset = pickle.load(f)
-
-            _, test_task_info, test_perf_metrics = evaluate_multi(
-                test_dataset, model=trained_meta_model, n_gpu=trained_meta_model.n_gpu,
-                get_all_reprs = False, batch_size=2*args.batch_size, tqdm=tqdm, num_workers=28,
-                args=args,
-            )
-
-            with open(os.path.join(args.run_dir, 'test_task_info.pkl'), mode='wb') as f:
-                pickle.dump(test_task_info, f)
-            with open(os.path.join(args.run_dir, 'test_perf_metrics.pkl'), mode='wb') as f:
-                pickle.dump(test_perf_metrics, f)
-
-            tuning_scores = -pd.Series(ObjectiveFntr.perf_metrics_to_trial_result(perf_metrics))
-            test_scores = -pd.Series(ObjectiveFntr.perf_metrics_to_trial_result(test_perf_metrics))
-
-            loss = tuning_scores.mean()
-            loss_variance = tuning_scores.std()**2
-            test_loss = test_scores.mean()
-            test_loss_variance = test_scores.std()**2
             status = STATUS_OK
         except Exception as e:
             loss, test_loss = np.NaN, np.NaN
-            loss_variance, test_loss_variance = np.NaN, np.NaN
             status = STATUS_FAIL
             with open(os.path.join(args.run_dir, 'error.pkl'), mode='wb') as f: pickle.dump(e, f)
 
             print("Errored on %s: %s" % (args.run_dir, e))
+            traceback.print_exc()
+            with open(os.path.join(args.run_dir, 'error.txt'), mode='w') as f: traceback.print_exc(file=f)
 
         return {
             'loss': loss,
-            'loss_variance': loss_variance,
             'true_loss': test_loss,
-            'true_loss_variance': test_loss_variance,
             'status': status,
         }
 
@@ -754,7 +748,7 @@ def main(hyperparameter_search_args, tqdm=tqdm, fmin_kwargs=None):
     if fmin_kwargs is None: fmin_kwargs = {}
 
     search_dir = hyperparameter_search_args.search_dir
-    hyperparameter_search_args.to_json_file(os.path.join(search_dir, "hyperopt_args.json"))
+    hyperparameter_search_args.to_json_file(os.path.join(search_dir, HYPERPARAMETER_SEARCH_ARGS_FILENAME))
 
     hyperopt_space, constant_params = read_config(search_dir)
 
@@ -766,7 +760,8 @@ def main(hyperparameter_search_args, tqdm=tqdm, fmin_kwargs=None):
     objective = ObjectiveFntr(
         base_dir, rotation, constant_params, tqdm,
         single_task=hyperparameter_search_args.single_task_search,
-        do_match_train_windows=hyperparameter_search_args.do_match_train_windows
+        do_match_train_windows=hyperparameter_search_args.do_match_train_windows,
+        do_eicu=hyperparameter_search_args.do_eicu,
     )
 
     algo = HP_ALGS[hyperparameter_search_args.algo]

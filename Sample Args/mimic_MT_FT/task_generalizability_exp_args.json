@@ -1,0 +1,20 @@
+{
+    "exp_dir": "/crimea/mmd/comprehensive_MTL_EHR/Sample Args/mimic_MT_FT",
+    "do_eicu": false,
+    "rotation": 0,
+    "do_eval": false,
+    "do_train": false,
+    "do_fine_tune": true,
+    "do_fine_tune_eval": true,
+    "do_frozen_representation": true,
+    "do_free_representation": true,
+    "do_match_FT_train_windows": false,
+    "slurm": false,
+    "partition": "p100",
+    "slurm_args": "",
+    "do_small_data": true,
+    "do_imbalanced_sex_data": false,
+    "do_imbalanced_race_data": false,
+    "train_embedding_after": -1,
+    "do_single_task": false
+}

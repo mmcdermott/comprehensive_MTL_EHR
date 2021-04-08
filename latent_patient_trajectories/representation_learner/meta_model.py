@@ -80,41 +80,64 @@ def strip_module_and_load(recipient, loaded_state_dict):
 
         recipient.load_state_dict(new_state_dict)
 
-class MetaModel():
-    def __init__(self, args, sample_datum, class_names=None, use_cuda=torch.cuda.is_available()):
+class MetaModel(): #nn.Module: doesn't need to be a nn module
+    def __init__(self, args, sample_datum, class_names=None, verbose=False, use_cuda=torch.cuda.is_available()):
         print("curr path:", args.run_dir)
         assert os.path.isdir(args.run_dir)
         if class_names is None: class_names = {}
 
         self.run_dir = args.run_dir
+        self.do_eicu = args.do_eicu
+
+        self.debug = False
 
         device = torch.device("cuda" if use_cuda else "cpu")
         n_gpu = 0 if not use_cuda else torch.cuda.device_count()
         self.device = device
         self.n_gpu = n_gpu
 
+        self.do_masked_imputation = args.do_masked_imputation
+        self.do_fake_masked_imputation_shape = args.do_fake_masked_imputation_shape
+        assert not (self.do_fake_masked_imputation_shape and self.do_masked_imputation), \
+            "Can't fake and mask!"
+
         self.class_names = class_names
         task_weights, task_class_weights = None, {'tasks_binary_multilabel': torch.ones(len(self.class_names['tasks_binary_multilabel'])).to(self.device)}
+
+        # We can handle zeroing out the regression task through the ablation interface.
+        if args.regression_task_weight in (0, None):
+            if args.ablate:
+                if isinstance(args.ablate, str): args.ablate=[args.ablate]
+                if 'next_timepoint' not in args.ablate: args.ablate.append('next_timepoint')
+            else: args.ablate = ['next_timepoint']
+
         if args.task_weights_filepath:
+            print("filepath")
             assert os.path.isfile(args.task_weights_filepath), "Task weights file does not exist!"
             assert args.regression_task_weight == 1, "Can't set both regression task weight and file!"
             assert not args.ablate, "Can't both use a file and an ablation code."
 
             with open(args.task_weights_filepath, mode='r') as f: task_weights = json.loads(f.read())
-        elif args.regression_task_weight != 1:
+        elif args.regression_task_weight not in (1, 0, None):
+            print("regression weight")
             assert not os.path.isfile(args.task_weights_filepath), "Can't use both a file and a reg. weight!"
-            assert not args.ablate, "Can't both use a reg. weight and an ablation code!"
+            # assert not args.ablate, "Can't both use a reg. weight and an ablation code!" # this is commented out because now, by default regression is turned off.
 
-            task_weights = {t: 1 for t in ALL_TASKS}
+            task_weights = {t: 1 if t in ALL_TASKS_EICU or not self.do_eicu else 0 for t in ALL_TASKS}
             task_weights['next_timepoint'] = args.regression_task_weight
         elif args.ablate:
             assert not os.path.isfile(args.task_weights_filepath), "Can't use both an ablation and a file!"
-            assert args.regression_task_weight == 1, "Can't set both regression task weight and ablation!"
+            assert args.regression_task_weight in (None, 0, 1), \
+                "Can't set both regression task weight and ablation!"
+            if args.regression_task_weight in (None, 0):
+                assert 'next_timepoint' in args.ablate or 'next_timepoint_info' in args.ablate, \
+                    "Must ablate the regression task with a weighting of 0! Should happen automatically."
 
             print("Ablating!")
 
             task_weights, task_class_weights = self.ablate(args.ablate, post_init=False)
         else:
+            print("else")
             task_weights, task_class_weights = self.ablate(None, post_init=False)
 
         self.add_cls_analog = False
@@ -127,6 +150,9 @@ class MetaModel():
         # No batch size as this is just accessed via dataset[#].
         ts_feat_dim, statics_feat_dim = sample_datum['ts'].shape[1], sample_datum['statics'].shape[0]
         pred_dim = sample_datum['next_timepoint'].shape
+
+        # For the is-masked bit.
+        if self.do_masked_imputation or self.do_fake_masked_imputation_shape: ts_feat_dim += 1
 
         config = {
             "attention_probs_dropout_prob": 0.1,
@@ -151,33 +177,15 @@ class MetaModel():
         # default arg is self attention timeseries
 
         # alternative is CNN
-        if args.modeltype.lower() == 'cnn':
-            model = CNN(
-                bert_config, data_shape=[args.max_seq_len, args.hidden_size],
-                use_cuda=torch.cuda.is_available(), conv_layers = list(args.num_filters),
-                kernel_sizes=list(args.kernel_sizes), fc_layer_sizes = list(args.fc_layer_sizes),
-                pooling_method = args.pooling_method, pooling_kernel_size = args.pooling_kernel_size,
-                pooling_stride = args.pooling_stride, conv_layers_per_pool = args.conv_layers_per_pool,
-                task_weights = task_weights, task_class_weights=task_class_weights,
-            )
-        elif args.modeltype.lower() == 'gru':
-            model = GRUModel(
-                bert_config, data_shape=[args.max_seq_len, args.hidden_size], use_cuda=torch.cuda.is_available(),
-                hidden_dim=args.gru_hidden_layer_size, num_layers=args.gru_num_hidden,
-                bidirectional=args.do_bidirectional, task_weights=task_weights,
-                pooling_method=args.gru_pooling_method, task_class_weights=task_class_weights,
-            )
-        elif args.modeltype.lower() =='linear':
-            model = LinearModel(
-                bert_config, data_shape=[args.max_seq_len, args.hidden_size],
-                use_cuda=torch.cuda.is_available(), task_weights=task_weights,
-                task_class_weights=task_class_weights,
-            )
-        else:
-            model = SelfAttentionTimeseries(
-                bert_config, use_cuda=torch.cuda.is_available(), task_weights=task_weights,
-                task_class_weights=task_class_weights,
-            )
+        assert args.modeltype.lower() == 'gru', "Only GRU is supported in this version."
+        model = GRUModel(
+            bert_config, data_shape=[args.max_seq_len, args.hidden_size], use_cuda=torch.cuda.is_available(),
+            hidden_dim=args.gru_hidden_layer_size, num_layers=args.gru_num_hidden,
+            bidirectional=args.do_bidirectional, task_weights=task_weights,
+            pooling_method=args.gru_pooling_method, task_class_weights=task_class_weights,
+            verbose = verbose,
+            do_eicu = self.do_eicu,
+        )
 
         # TODO(mmd): Need to also load ts_projector.
         ts_projector = nn.Linear(ts_feat_dim, bert_config.hidden_size)
@@ -264,11 +272,15 @@ class MetaModel():
                 pickle.dump({'task_weights': {}, 'task_class_weights': task_class_weights}, f)
             return None, task_class_weights
 
-        task_weights = {t: 1 for t in ALL_TASKS}
+        task_weights = {t: 1 if t in ALL_TASKS_EICU or not self.do_eicu else 0 for t in ALL_TASKS}
+        if self.do_masked_imputation:
+#             print('Since masked_imputation is set to True, all other tasks are being  ablated.')
+#             task_weights = {t: 0 for t in ALL_TASKS}
+            print("setting task_weights['masked_imputation'] to 1")
+            task_weights['masked_imputation'] = 1
 
         if isinstance(ablate, str): ablate=[ablate]
-        # 'rolling_fts', 'disch_24h', 'disch_48h', 'Final Acuity Outcome', 'tasks_binary_multilabel', 'next_timepoint', 'next_timepoint_was_measured'
-        for ablation in ablate:
+        for ablation in ablate + ['next_timepoint']:
             if ablation in ABLATION_GROUPS.keys():
                 #ablate entire ablation group
                 # need a list of each variable for this assertion
@@ -280,7 +292,7 @@ class MetaModel():
                         # self.task_class_weights['tasks_binary_multilabel'] must be a tensor with the 1 element for each binary multilabel class
                         task_class_weights['tasks_binary_multilabel'][
                             self.class_names['tasks_binary_multilabel'].index(t)
-                        ]=0
+                        ] = 0
                         #
             elif ablation in ALL_TASKS:
                 # ablate individual task
@@ -290,7 +302,6 @@ class MetaModel():
                     f'Error trying to ablate {ablation}. It is not found in the eligible ablation groups '
                      'or any of the tasks.'
                 )
-
 
         if post_init:
             self.model.task_weights = task_weights
@@ -322,6 +333,8 @@ class MetaModel():
             if m is not None: m.train()
 
     def eval(self):
+        # assert not self.do_masked_imputation, "I shouldn't being masking in eval mode!"
+        # we need to mask in eval mode for hyperparameter search
         for m in self.trainable_models:
             if m is not None: m.eval()
 
@@ -396,17 +409,37 @@ class MetaModel():
     #    return data.to(device).float()
 
     def forward(self, batch):
+        if 'rolling_fts' in batch:
+            batch['rolling_ftseq'] = batch['rolling_fts']
+            del batch['rolling_fts']
         for k, value in batch.items(): batch[k]=value.float().to(self.device)
 
         single_batch = (batch['ts'].shape[0] == 1)
 
         statics, ts = batch['statics'], batch['ts']
+        if self.debug:
+            extra_out = {}
+            extra_out['ts_orig'] = ts.detach().cpu().numpy()
 
+        if self.do_masked_imputation:
+            # TODO(mmd): These should be constants in the constant file.
+            ts_vals_key, ts_is_measured_key, imputation_mask_key = 'ts_vals', 'ts_is_measured', 'ts_mask'
+            assert ts_vals_key in batch and ts_is_measured_key in batch and imputation_mask_key in batch, \
+                str(batch.keys())
+
+            ts = ts * (1-batch[imputation_mask_key]).expand_as(ts)
+            ts = torch.cat([ts, batch[imputation_mask_key]], dim=2)
+        elif self.do_fake_masked_imputation_shape:
+            # Add a bunch of zeros everywhere to indicate nothing was masked.
+            fake_mask_indicators = torch.zeros_like(ts[:, :, 0:1])
+            ts = torch.cat([ts, fake_mask_indicators], dim=2)
+
+        if self.debug:
+            extra_out['ts'] = ts.detach().cpu().numpy()
         input_sequence = self.ts_projector(ts)
 
         batch_size, seq_len, ts_feat_dim = list(ts.shape)
         batch_size, statics_feat_dim = list(statics.shape)
-
 
         statics = self.statics_projector(statics)
         input_sequence += statics.unsqueeze(1).expand([batch_size, seq_len, self.bert_config.hidden_size])
@@ -427,7 +460,6 @@ class MetaModel():
             batch['ts_mask'] = torch.cat((mask_addition, ts_mask), dim=1)
 
         batch['input_sequence'] = input_sequence
-
 
         if self.notes == 'integrate_note_bert':
             note_ids = batch['note_ids']
@@ -508,9 +540,9 @@ class MetaModel():
             batch['input_sequence'] += input_embeddings
             batch = {k: fit_on_device(v, single_batch, self.device) for k, v in batch.items()}
 
-
         hidden_states, pooled_output, all_outputs, total_loss = self.model(batch)
-        if self.n_gpu > 1: total_loss = total_loss.sum() # Across all gpus...
+        if self.n_gpu > 1: total_loss = total_loss.mean() # Across all gpus...
 
-        return hidden_states, pooled_output, all_outputs, total_loss
+        if self.debug: return hidden_states, pooled_output, all_outputs, total_loss, extra_out
+        else: return hidden_states, pooled_output, all_outputs, total_loss
 

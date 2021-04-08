@@ -8,11 +8,16 @@ TASK_GENERALIZABILITY_DIR   = os.path.join(RUNS_DIR, 'task_generalizability')
 DATA_DIR                    = os.path.join(PROJECT_DIR, 'processed_data')
 # DATA_DIR                    = '/scratch/gobi2/bnestor/mimic_extraction_results'
 ROTATIONS_DIR               = os.path.join(PROJECT_DIR, 'dataset', 'rotations')
+EICU_ROTATIONS_DIR          = os.path.join(PROJECT_DIR, 'dataset_eicu', 'rotations')
 DATA_FILENAME               = 'all_hourly_data.h5'
+EICU_DATA_FILENAME          = 'eicu_extract.hdf'
 FOLDS_FILENAME              = 'subject_ids_per_fold.pkl'
+EICU_FOLDS_FILENAME         = 'eicu_subject_ids_per_fold.pkl'
 FTS_FILENAME                = 'treatment_sequence.h5'
+EICU_FTS_FILENAME           = 'eicu_treatment_set.h5'
 NOTES_FILENAME              = 'notes.hdf'
 ARGS_FILENAME               = 'args.json'
+HYPERPARAMETER_SEARCH_ARGS_FILENAME = 'hyperopt_args.json'
 PARAMS_FILENAME             = 'raw_params.json'
 FINE_TUNE_ARGS_FILENAME     = 'fine_tune_args.json'
 EVAL_ARGS_FILENAME          = 'eval_args.json'
@@ -21,6 +26,7 @@ CLUSTERING_CONFIG_FILENAME  = 'clustering_config.json'
 CONFIG_FILENAME             = 'bert_config.json'
 HYP_CONFIG_FILENAME         = 'hyperparameter_search_config.json'
 TASK_GEN_CFG_FILENAME       = 'task_generalizability_config.json'
+HYP_REEVAL_CFG_FILENAME     = 'hyperparameter_search_re_eval_config.json'
 TASK_GEN_BASE_ARGS_FILENAME = 'task_generalizability_model_base_args.json'
 TASK_GEN_EXP_ARGS_FILENAME  = 'task_generalizability_exp_args.json'
 GET_ALL_FLAT_REPR_ARGS_FILENAME = 'get_all_flat_repr_args.json'
@@ -43,6 +49,8 @@ HADM_ID    = 'hadm_id'
 
 ID_COLS = [ICUSTAY_ID, HADM_ID, SUBJECT_ID]
 
+EVAL_FILE_TEMPLATES = ('%s_reprs.pkl', '%s_task_info.pkl', '%s_perf_metrics.pkl')
+
 FOLD_IDX_LVL = 'Fold'
 K = 10 # K-fold CV
 
@@ -54,8 +62,7 @@ EXCLUSION_CRITERIA = {
 
 PATIENT_ID_COLS = [SUBJECT_ID, HADM_ID, ICUSTAY_ID] # TODO(mmd): We need a separate one for some joins. Why?
 
-ALL_TASKS = [
-    'rolling_fts',
+ALL_TASKS_EICU = [
     'disch_24h',
     'disch_48h',
     'Final Acuity Outcome',
@@ -63,6 +70,16 @@ ALL_TASKS = [
     'next_timepoint',
     'next_timepoint_was_measured',
 ]
+ALL_TASKS = [
+    'rolling_ftseq',
+    'disch_24h',
+    'disch_48h',
+    'Final Acuity Outcome',
+    'tasks_binary_multilabel',
+    'next_timepoint',
+    'next_timepoint_was_measured',
+]
+EICU_ABLATION_GROUPS = ['discharge', 'mortality', 'los', 'acuity', 'next_timepoint_info']
 ABLATION_GROUPS = {
     'icd10': [
         'icd_infection', 'icd_neoplasms', 'icd_endocrine', 'icd_blood', 'icd_mental', 'icd_nervous',
@@ -74,7 +91,7 @@ ABLATION_GROUPS = {
     'mortality': ['mort_24h', 'mort_48h'],
     'los': ['Long LOS'],
     'readmission': ['Readmission 30'],
-    'future_treatment_sequence': ['rolling_fts'],
+    'future_treatment_sequence': ['rolling_ftseq'],
     'acuity': ['Final Acuity Outcome'],
     'next_timepoint_info': ['next_timepoint', 'next_timepoint_was_measured'],
     'dnr': ['dnr_24h', 'dnr_48h'],
@@ -108,18 +125,31 @@ TRAIN, TUNING, HELD_OUT = 'train', 'tuning', 'held out'
 UNK = 'Unknown'
 
 ABBREVIATIONS = {
-    'Imminent Mortality':              'MOR',
-    'Comfort Measures':                'CMO',
-    'DNR Ordered':                     'DNR',
-    'ICD Code Prediction':             'ICD',
-    'Long LOS':                        'LOS',
-    '30-day Readmission':              'REA',
-    'Imminent Discharge':              'DIS',
-    'Final Acuity Outcome':            'ACU',
-    'Next Hour Will-be-measured':      'WBM',
-    'Future Treatment Sequence (FTS)': 'FTS',
+    'Imminent Mortality':               'MOR',
+    'Comfort Measures':                 'CMO',
+    'DNR Ordered':                      'DNR',
+    'ICD Code Prediction':              'ICD',
+    'Long LOS':                         'LOS',
+    '30-day Readmission':               'REA',
+    'Imminent Discharge':               'DIS',
+    'Final Acuity Outcome':             'ACU',
+    'Next Hour Will-be-measured':       'WBM',
+    'Future Treatment Sequence (FTS)':  'FTS',
+    'Masked Imputation Regression':     'MIR',
+    'Masked Imputation Classification': 'MIC',
 }
 
+MASKED_IMPUTATION_BREAKDOWN = {
+    ABBREVIATIONS['Masked Imputation Regression']:     'masked_imputation_regression',
+    ABBREVIATIONS['Masked Imputation Classification']: 'masked_imputation_classification',
+}
+EICU_MANUSCRIPT_BREAKDOWN = {
+    ABBREVIATIONS['Imminent Mortality']:              ('tasks_binary_multilabel','all_time',lambda s: s.startswith('mort')),
+    ABBREVIATIONS['Long LOS']:                        ('tasks_binary_multilabel','first_24','Long LOS'),
+    ABBREVIATIONS['Imminent Discharge']:              ['disch_24h', 'disch_48h'],
+    ABBREVIATIONS['Final Acuity Outcome']:            'Final Acuity Outcome',
+    ABBREVIATIONS['Next Hour Will-be-measured']:      'next_timepoint_was_measured',
+}
 MANUSCRIPT_BREAKDOWN = {
     ABBREVIATIONS['Imminent Mortality']:              ('tasks_binary_multilabel','all_time',lambda s: s.startswith('mort')),
     ABBREVIATIONS['Comfort Measures']:                ('tasks_binary_multilabel','all_time',lambda s: s.startswith('cmo')),
@@ -130,7 +160,7 @@ MANUSCRIPT_BREAKDOWN = {
     ABBREVIATIONS['Imminent Discharge']:              ['disch_24h', 'disch_48h'],
     ABBREVIATIONS['Final Acuity Outcome']:            'Final Acuity Outcome',
     ABBREVIATIONS['Next Hour Will-be-measured']:      'next_timepoint_was_measured',
-    ABBREVIATIONS['Future Treatment Sequence (FTS)']: 'rolling_fts',
+    ABBREVIATIONS['Future Treatment Sequence (FTS)']: 'rolling_ftseq',
 }
 EVAL_MODES = ('all_time', 'first_24', 'extend_till_discharge')
 EVAL_MODES_BY_ABLATION_GROUPS = {
@@ -205,3 +235,21 @@ ALWAYS_EQ_KEYS = [
     'task_losses.tasks_binary_multilabel.BCE_LL.pos_weight',
     'bert.encoder.layer.0.attention.self.key.bias',
 ]
+
+ABLATIONS_TO_REPORTING_MAP = {
+    'mortality':                 ABBREVIATIONS['Imminent Mortality'],
+    'cmo':                       ABBREVIATIONS['Comfort Measures'],
+    'dnr':                       ABBREVIATIONS['DNR Ordered'],
+    'icd10':                     ABBREVIATIONS['ICD Code Prediction'],
+    'los':                       ABBREVIATIONS['Long LOS'],
+    'readmission':               ABBREVIATIONS['30-day Readmission'],
+    'discharge':                 ABBREVIATIONS['Imminent Discharge'],
+    'acuity':                    ABBREVIATIONS['Final Acuity Outcome'],
+    'next_timepoint_info':       ABBREVIATIONS['Next Hour Will-be-measured'],
+    'future_treatment_sequence': ABBREVIATIONS['Future Treatment Sequence (FTS)'],
+}
+
+SMALL_DATA_FRACS = (
+    0.00029, 0.001, 0.001778, 0.003162, 0.005623, 0.01, 0.01778279, 0.03162278, 0.05623413, 0.1, 0.1778,
+    0.3162, 0.5623,
+)

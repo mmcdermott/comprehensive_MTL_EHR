@@ -17,7 +17,7 @@ class BaseArgs(ABC):
 
     def to_dict(self): return asdict(self)
     def to_json_file(self, filepath):
-        with open(filepath, mode='w') as f: f.write(json.dumps(asdict(self)))
+        with open(filepath, mode='w') as f: f.write(json.dumps(asdict(self), indent=4))
     def to_pickle_file(self, filepath):
         with open(filepath, mode='wb') as f: pickle.dump(self, f)
 
@@ -49,7 +49,12 @@ class BaseArgs(ABC):
             args_path = os.path.join(load_dir, args_filename)
             assert os.path.exists(args_path), "Args file (%s) must exist!" % args_path
 
-            return cls.from_json_file(args_path)
+            new_args = cls.from_json_file(args_path)
+
+            assert os.path.samefile(vars(new_args)[main_dir_arg], load_dir),\
+                f"{main_dir_arg}: {vars(new_args)[main_dir_arg]} doesn't match loaded file: {load_dir}!"
+
+            return new_args
 
         args_dict = vars(args)
         if 'do_load_from_dir' in args_dict: args_dict.pop('do_load_from_dir')
@@ -87,6 +92,9 @@ class Args(BaseArgs):
     dataset_dir:             str   = None # Not used by default--inferred from rotation.
     num_dataloader_workers:  int   = 23 # Num dataloader workers. Can increase.
 
+    do_eicu:                 bool  = False # This doesn't affect the dataset pulled, but rather affects model
+                                           # dimensions and such.
+
     # Training Params (set)
     epochs:                  int   = 50
     do_train:                bool  = True
@@ -117,6 +125,8 @@ class Args(BaseArgs):
     num_hidden_layers:       int   = 2
     batch_size:              int   = 32
     learning_rate:           float = 1e-4
+    # We track this separately to give hyperparameter tuning an easier way to disable this.
+    do_learning_rate_decay:  bool  = True
     learning_rate_decay:     float = 1 # decay gamma. 1 is no change.
     learning_rate_step:      int   = 1
     note_bert_lr_reduce:     bool  = 1
@@ -127,8 +137,11 @@ class Args(BaseArgs):
     gru_hidden_layer_size:   int   = 512
     gru_pooling_method:      str   = 'last'
     task_weights_filepath:   str   = "" # If empty, uses no weights.
-    regression_task_weight:  float = 1 # shortcut for tuning up or down this task specifically.
+    regression_task_weight:  float = 0 # By default Regression is OFF for now.
     do_add_cls_analog:       bool  = False
+    do_masked_imputation:    bool  = False
+    do_fake_masked_imputation_shape: bool  = False # For FT masked imputation models.
+    imputation_mask_rate:    float = 0.0 # by default no masking.
     hidden_dropout_prob:     float = 0.1
     pooling_method:          str   = 'max'
     pooling_kernel_size:     int   = 4
@@ -136,14 +149,18 @@ class Args(BaseArgs):
     conv_layers_per_pool:    int   = 1
     do_bidirectional:        bool  = False
     fc_layer_sizes:          tuple = (256,)
+    # We track this separately to give hyperparameter tuning an easier way to disable this.
+    do_weight_decay:         bool  = True
     weight_decay:            float = 0
     gru_fc_layer_sizes:      tuple = tuple()
 
     ablate:                  tuple = tuple()
-        
+
     frac_data:      float= 1.0 # how much of the fine_tuning data should we use?
     frac_data_seed: int  = 0 # how much of the fine_tuning data should we use?
     frac_female:    float= 1.0 # how much of the fine_tuning data should we use?
+    frac_black:     float= 1.0 # how much of the fine_tuning data should we use?
+    balanced_race:  bool = False # should the number of white patients be reduced to have class balance between black and white patients
 
     # Debug
     do_test_run:             bool  = False
@@ -161,6 +178,8 @@ class Args(BaseArgs):
         parser.add_argument('--rotation', type=intlt(10), default=0)
         parser.add_argument('--dataset_dir', type=str, default=None, help='Explicit dataset path (else use rotation).')
         parser.add_argument('--num_dataloader_workers', type=int, default=4, help='# dataloader workers.')
+        parser.add_argument("--do_eicu", action="store_true", help="set flag to use eICU", default=False)
+        parser.add_argument("--no_do_eicu", action="store_false", dest="do_eicu")
 
         # Training Params (set)
         parser.add_argument("--modeltype", type=str, default='self_attention', choices = ['self_attention', 'cnn', 'gru', 'linear'], help="number of training epochs")
@@ -195,6 +214,8 @@ class Args(BaseArgs):
 
         # Hyperparameters (tune)
         parser.add_argument('--weight_decay', type=float, default=0, help="L2 weight decay penalty")
+        parser.add_argument('--do_weight_decay', action='store_true', default=True, help="Do L2 weight decay?")
+        parser.add_argument('--no_do_weight_decay', dest='do_weight_decay', action='store_false')
         parser.add_argument("--in_dim", type=int, default=128, help="input dimensionality")
         parser.add_argument("--hidden_size", type=int, default=128, help="hidden size")
         parser.add_argument("--intermediate_size", type=int, default=128, help="intermediate size")
@@ -202,6 +223,8 @@ class Args(BaseArgs):
         parser.add_argument("--num_hidden_layers", type=int, default=2, help="# of hidden layers")
         parser.add_argument("--batch_size", type=int, default=32, help="batch size for train, test, and eval")
         parser.add_argument("--learning_rate", type=float, default=1e-4, help="learning rate for the model")
+        parser.add_argument('--do_learning_rate_decay', action='store_true', default=True, help="Do learning rate decay?")
+        parser.add_argument('--no_do_learning_rate_decay', dest='do_learning_rate_decay', action='store_false')
         parser.add_argument("--learning_rate_decay", type=float, default=1, help="lr decay factor")
         parser.add_argument("--learning_rate_step", type=int, default=1, help="#epochs / lr decay")
         parser.add_argument("--note_bert_lr_reduce", type=int, default=1, help='reduce the learning rate for note bert by this factor')
@@ -216,9 +239,25 @@ class Args(BaseArgs):
         )
         parser.add_argument(
             '--do_add_cls_analog', action='store_true', default=False,
-            help='Will use small dataset. Faster runtime.'
+            help='Will add a [CLS] token analog for the transformer model. Only appropriate for transformers.'
         )
         parser.add_argument('--no_do_add_cls_analog', action='store_false', dest='do_add_cls_analog')
+
+        parser.add_argument(
+            '--do_masked_imputation', action='store_true', default=False,
+            help=(
+                'Will also run the masked imputation task. Likely only suitable for pre-training. '
+                'Will not be applied during evaluation.'
+            )
+        )
+        parser.add_argument('--no_do_masked_imputation', action='store_false', dest='do_masked_imputation')
+        parser.add_argument(
+            '--do_fake_masked_imputation_shape', action='store_true', default=False,
+            help="Adds the mask dimension to the ts dim, for resuming from Masked Imputation models."
+        )
+        parser.add_argument('--no_do_fake_masked_imputation_shape', action='store_false', dest='do_fake_masked_imputation_shape')
+        parser.add_argument('--imputation_mask_rate', type=float, default=0, help='Masking rate.')
+
         parser.add_argument('--hidden_dropout_prob', type=float, default=0.1, help='dropout')
         parser.add_argument('--pooling_method', type=within(('max', 'avg')), default='max', help='pooling?')
         parser.add_argument('--pooling_kernel_size', type=int, default=4, help='pooling kernel size')
@@ -228,10 +267,12 @@ class Args(BaseArgs):
         parser.add_argument('--no_do_bidirectional', action='store_false', dest='do_bidirectional')
         parser.add_argument('--fc_layer_sizes', type=int, nargs='+', default=(256,), help='cnn fc stack')
         parser.add_argument('--gru_fc_layer_sizes', type=int, nargs='+', default=tuple(), help='gru fc stack')
-        parser.add_argument('--regression_task_weight', type=float, default=1, help='weight on regresssion')
+        parser.add_argument('--regression_task_weight', type=float, default=0, help='weight on regresssion')
         parser.add_argument('--frac_data', type=float, default=1.0, help='# dataloader workers.')
         parser.add_argument('--frac_female', type=float, default=1.0, help='Number of females in terms of percent of male patients')
+        parser.add_argument('--frac_black', type=float, default=1.0, help='Number of black pts vs. white')
         parser.add_argument('--frac_data_seed', type=int, default=0, help='random seed for subsampling the data for fine_tuning')
+        parser.add_argument('--balanced_race', action='store_true',  help='Balance number of black and white patients during training?')
 
         # Debug
         parser.add_argument('--do_test_run', action='store_true', default=False, help='Will use small dataset. Faster runtime.')
@@ -252,16 +293,24 @@ class Args(BaseArgs):
 # TODO(mmd): Eventually make accept list of tasks so can work of groups of ablated tasks.
 @dataclass
 class FineTuneArgs(BaseArgs):
+    run_dir:                  str   = "" # required
+    do_eicu:                  bool  = False
+    fine_tune_task:           str   = "" # required
+    num_dataloader_workers:   int   = 8 # Num dataloader workers. Can increase.
+    frac_fine_tune_data:      float = 1.0 # how much of the fine_tuning data should we use? # DEPRECATED
+    frac_fine_tune_data_seed: int   = 0 # how much of the fine_tuning data should we use?
+    frac_female:              float = 1.0 # how much of the fine_tuning data should we use?
+    frac_black:               float = 1.0 # how much of the fine_tuning data should we use?
+    balanced_race:            bool  = False
+    train_embedding_after:    int   = -1 # should the embedding be frozen (-1) or trained after a number of epochs?
+    do_match_train_windows:   bool  = True # Whether to match the train window regime to evaluation regime
+    do_frozen_representation: bool  = True # Whether to train the FTD (fine-tuning, decoder-only) variant.
+    do_free_representation:   bool  = False # Whether to train the FTF (fine-tuning, full) variant.
+    do_small_data:            bool  = False # Whether to also train across various small-data levels
+    do_single_task:           bool  = False
+    do_masked_imputation_PT:  bool = False
+    verbose:                  bool  = False # Whether to match the train window regime to evaluation regime
 
-    run_dir:                  str  = "" # required
-    fine_tune_task:           str  = "" # required
-    num_dataloader_workers:   int  = 8 # Num dataloader workers. Can increase.
-    frac_fine_tune_data:      float= 1.0 # how much of the fine_tuning data should we use?
-    frac_fine_tune_data_seed: int  = 0 # how much of the fine_tuning data should we use?
-    frac_female:      float= 1.0 # how much of the fine_tuning data should we use?
-    train_embedding_after:    int = -1 # should the embedding be frozen (-1) or trained after a number of epochs?
-    do_match_train_windows:   bool = True # Whether to match the train window regime to evaluation regime
-    
                                           # E.g., use only first 24 hours, etc.
 
     @classmethod
@@ -269,6 +318,26 @@ class FineTuneArgs(BaseArgs):
         parser.add_argument(
             "--fine_tune_task", type=within(ALL_TASKS + list(ABLATION_GROUPS.keys())), help="Which task?"
         )
+        parser.add_argument(
+            '--do_masked_imputation_PT', action='store_true', default=True, help='Masked Imputation PT?'
+        )
+        parser.add_argument(
+            '--no_do_masked_imputation_PT', action='store_false', dest='do_masked_imputation_PT'
+        )
+        parser.add_argument('--do_single_task', action='store_true', default=True, help='Single task?')
+        parser.add_argument('--no_do_single_task', action='store_false', dest='do_single_task')
+        parser.add_argument('--do_small_data', action='store_true', default=True, help='Small Data?')
+        parser.add_argument('--no_do_small_data', action='store_false', dest='do_small_data')
+        parser.add_argument('--do_frozen_representation', action='store_true', default=True, help='FTD?')
+        parser.add_argument(
+            '--no_do_frozen_representation', action='store_false', dest='do_frozen_representation'
+        )
+        parser.add_argument('--do_free_representation', action='store_true', default=False, help='FTE?')
+        parser.add_argument(
+            '--no_do_free_representation', action='store_false', dest='do_free_representation'
+        )
+        parser.add_argument("--do_eicu", action="store_true", help="set flag to use eICU", default=False)
+        parser.add_argument("--no_do_eicu", action="store_false", dest="do_eicu")
         parser.add_argument("--run_dir", type=str, required=True, help="Dir for this generalizability exp.")
         parser.add_argument('--num_dataloader_workers', type=int, default=4, help='# dataloader workers.')
         parser.add_argument(
@@ -282,7 +351,11 @@ class FineTuneArgs(BaseArgs):
         parser.add_argument('--frac_fine_tune_data', type=float, default=1.0, help='# dataloader workers.')
         parser.add_argument('--frac_fine_tune_data_seed', type=int, default=0, help='random seed for subsampling the data for fine_tuning')
         parser.add_argument('--frac_female', type=float, default=1.0, help='# dataloader workers.')
+        parser.add_argument('--frac_black', type=float, default=1.0, help='ratio of black patients compared to white patients')
+        parser.add_argument('--balanced_race', action='store_true', help='Start with a balanced number of black patients to white patients.')
+
         parser.add_argument('--train_embedding_after', type=int, default=-1, help='Decide whether the embedding should be frozen (-1) or trained after this number of epochs. An argument of 0 will train the embedding for the whole fine-tuning window.')
+        parser.add_argument('--verbose', action='store_true', help='print to motality file')
 
         return 'run_dir', FINE_TUNE_ARGS_FILENAME
 
@@ -301,10 +374,12 @@ class HyperparameterSearchArgs(BaseArgs):
     single_task_search: str = "" # By default is ignored.
     do_match_train_windows: bool = True # Match eval mode in training if single_task is set.
 
+    do_eicu: bool = False
+
     @classmethod
     def _build_argparse_spec(cls, parser):
         parser.add_argument("--search_dir", type=str, required=True, help="Dir for this search process.")
-        parser.add_argument("--algo", type=within({"tpe.suggest"}), default="tpe.suggest", help="Search algo")
+        parser.add_argument("--algo", type=within({"tpe.suggest", "rand.suggest"}), default="tpe.suggest", help="Search algo")
         parser.add_argument("--max_evals", type=int, default=100, help="How many evals")
         parser.add_argument("--rotation", type=intlt(10), default=0, help="Rotation")
 
@@ -324,30 +399,71 @@ class HyperparameterSearchArgs(BaseArgs):
         parser.add_argument(
             '--no_do_match_train_windows', action='store_false', dest='do_match_train_windows'
         )
+        parser.add_argument(
+            '--do_eicu', action='store_true', default=False, help='Run over the eICU dataset.'
+        )
+        parser.add_argument( '--no_do_eicu', action='store_false', dest='do_eicu')
 
-        return 'search_dir', ARGS_FILENAME
+        return 'search_dir', HYPERPARAMETER_SEARCH_ARGS_FILENAME
 
 @dataclass
 class TaskGeneralizabilityArgs(BaseArgs):
-    exp_dir:                   str  = "" # required
-    rotation:                  int  = 0
-    do_eval:                   bool = True
-    do_train:                  bool = True
-    do_fine_tune:              bool = True
-    do_fine_tune_eval:         bool = True
-    do_match_FT_train_windows: bool = False # Whether to match the train window regime to evaluation regime in fine-tuning.
-    slurm:                     bool = False
-    partition:                 str  = 'p100'
-    slurm_args:                str  = ""
+    exp_dir:                      str  = "" # required
+    do_eicu:                      bool = False # This doesn't affect the dataset pulled, but rather affects model
+    rotation:                     int  = 0
+    do_eval:                      bool = True
+    do_train:                     bool = True
+    do_fine_tune:                 bool = True
+    do_fine_tune_eval:            bool = True
+    do_frozen_representation:     bool = True # Whether to train the FTD (fine-tuning, decoder-only) variant.
+    do_free_representation:       bool = False # Whether to train the FTF (fine-tuning, full) variant.
+    do_match_FT_train_windows:    bool = False # Whether to match the train window regime to evaluation regime in fine-tuning.
+    slurm:                        bool = False
+    partition:                    str  = 'p100'
+    slurm_args:                   str  = ''
+    do_small_data:                bool = False
+    do_imbalanced_sex_data:       bool = False
+    do_imbalanced_race_data:      bool = False
+    train_embedding_after:        int  = -1 # should the embedding be frozen (-1) or trained after a number of epochs?
+    do_single_task:               bool = False
+    single_task:                  str  = None
+    do_masked_imputation_PT:      bool = False
+    do_copy_masked_imputation_PT: bool = True
 
     @classmethod
     def _build_argparse_spec(cls, parser):
         parser.add_argument("--exp_dir", type=str, required=True, help="Dir for this generalizability exp.")
+        parser.add_argument(
+            '--do_masked_imputation_PT', action='store_true', default=True, help='Masked Imputation PT?'
+        )
+        parser.add_argument(
+            '--no_do_masked_imputation_PT', action='store_false', dest='do_masked_imputation_PT'
+        )
+        parser.add_argument(
+            '--do_copy_masked_imputation_PT', action='store_true', default=True,
+            help='Copy Masked Imputation PT?'
+        )
+        parser.add_argument(
+            '--no_do_copy_masked_imputation_PT', action='store_false', dest='do_copy_masked_imputation_PT'
+        )
+        parser.add_argument('--do_single_task', action='store_true', default=True, help='Single task?')
+        parser.add_argument('--no_do_single_task', action='store_false', dest='do_single_task')
+        parser.add_argument('--single_task', type=str, default=None, help="What single task to do (if do)?")
+        parser.add_argument("--do_eicu", action="store_true", help="set flag to use eICU", default=False)
+        parser.add_argument("--no_do_eicu", action="store_false", dest="do_eicu")
         parser.add_argument("--rotation", type=intlt(10), default=0, help="Rotation")
         parser.add_argument('--do_eval', action='store_true', default=True, help='Evaluate as well?')
         parser.add_argument('--no_do_eval', action='store_false', dest='do_eval')
         parser.add_argument('--do_train', action='store_true', default=True, help='Train as well?')
         parser.add_argument('--no_do_train', action='store_false', dest='do_train')
+        parser.add_argument('--do_frozen_representation', action='store_true', default=True, help='FTD?')
+        parser.add_argument(
+            '--no_do_frozen_representation', action='store_false', dest='do_frozen_representation'
+        )
+        parser.add_argument('--do_free_representation', action='store_true', default=False, help='FTE?')
+        parser.add_argument(
+            '--no_do_free_representation', action='store_false', dest='do_free_representation'
+        )
         parser.add_argument('--do_fine_tune', action='store_true', default=True, help='Fine tune as well?')
         parser.add_argument('--no_do_fine_tune', action='store_false', dest='do_fine_tune')
         parser.add_argument('--do_fine_tune_eval', action='store_true', default=True, help='FT eval as well?')
@@ -371,13 +487,28 @@ class TaskGeneralizabilityArgs(BaseArgs):
             '--slurm_args', default="", nargs='+', help='slurm args to add to the job. IE. #SBATCH --{" --".join(args.slurm_args[])}'
         )
 
-        return 'exp_dir', ARGS_FILENAME
+        parser.add_argument(
+            '--do_small_data', action='store_true', help='Include restricted tasks in fine-tuning?'
+        )
+        parser.add_argument(
+            '--do_imbalanced_sex_data', action='store_true', help='Include frac female for fine-tuning?'
+        )
+        parser.add_argument(
+            '--do_imbalanced_race_data', action='store_true', help='Include frac female for fine-tuning?'
+        )
+        parser.add_argument(
+            '--train_embedding_after', type=int, default=-1, help='Decide whether the embedding should be frozen (-1) or trained after this number of epochs. An argument of 0 will train the embedding for the whole fine-tuning window.')
+
+        return 'exp_dir', TASK_GEN_EXP_ARGS_FILENAME
 
 @dataclass
 class EvalArgs(BaseArgs):
     run_dir:                  str  = "" # required
+    # notes and rotation need to be set properly, but are actually deprecated.
     notes:                    str  = "no_notes" # {no_notes, integrate_note_bert} TODO: add topics, doc2vec
     rotation:                 int  = 0
+    dataset_dir:              str  = None # by default this is inferred
+    do_eicu:                 bool  = False # This doesn't affect the dataset pulled, but rather affects model
     do_save_all_reprs:        bool = True
     do_eval_train:            bool = False
     do_eval_tuning:           bool = True
@@ -387,11 +518,19 @@ class EvalArgs(BaseArgs):
     do_debug_run:             bool = False
     do_overwrite:             bool = False
     eval_type:                str  = ''
+    eval_epoch:               str  = 'latest'
+    num_random_endpoints:     int  = 10
+
+    do_masked_imputation:    bool  = False
+    imputation_mask_rate:    float = 0.0 # by default no masking.
 
     @classmethod
     def _build_argparse_spec(cls, parser):
         parser.add_argument("--run_dir", type=str, required=True, help="Dir for this generalizability exp.")
         parser.add_argument("--rotation", type=intlt(10), default=0, help="Rotation")
+        parser.add_argument('--dataset_dir', type=str, default=None, help='Explicit dataset path (else use rotation).')
+        parser.add_argument("--do_eicu", action="store_true", help="set flag to use eICU", default=False)
+        parser.add_argument("--no_do_eicu", action="store_false", dest="do_eicu")
         parser.add_argument('--do_save_all_reprs', action='store_true', default=True, help='Save all reprs.')
         parser.add_argument('--no_do_save_all_reprs', action='store_false', dest='do_save_all_reprs')
         parser.add_argument('--do_eval_train', action='store_true', default=False, help='Eval Train')
@@ -407,7 +546,19 @@ class EvalArgs(BaseArgs):
         parser.add_argument('--no_do_debug_run', action='store_false', dest='do_debug_run')
         parser.add_argument('--do_overwrite', action='store_true', default=False, help='Overwrite any prior')
         parser.add_argument('--no_do_overwrite', action='store_false', dest='do_overwrite')
-        parser.add_argument('--eval_type', type=str, default='', choices=['', 'female', 'male',], help='Evaluate the dataset on a subset of the population')
+        parser.add_argument('--eval_type', type=str, default='', choices=['', 'female', 'male', 'black', 'white'], help='Evaluate the dataset on a subset of the population')
+        parser.add_argument('--eval_epoch', default='latest', help='The epoch to evaluate')
+        parser.add_argument('--num_random_endpoints', type=int, default=10, help='How many random endpoints?')
+
+        parser.add_argument(
+            '--do_masked_imputation', action='store_true', default=False,
+            help=(
+                'Will also run the masked imputation task. Likely only suitable for pre-training. '
+                'Will not be applied during evaluation.'
+            )
+        )
+        parser.add_argument('--no_do_masked_imputation', action='store_false', dest='do_masked_imputation')
+        parser.add_argument('--imputation_mask_rate', type=float, default=0, help='Masking rate.')
 
         return 'run_dir', EVAL_ARGS_FILENAME
 

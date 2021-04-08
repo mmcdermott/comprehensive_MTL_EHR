@@ -126,13 +126,6 @@ class SelfAttentionTimeseries(BertPreTrainedModel):
 
         # Tasks:
         **tasks_kwargs,
-        #rolling_fts = None,
-        #rolling_tasks_continuous = None,
-        #rolling_tasks_to_embed = None,
-        #static_tasks_continuous = None,
-        #static_tasks_to_embed = None,
-        #next_timepoint = None,
-        #next_timepoint_was_measured = None,
     ):
         # TODO(mmd): Embedding Features...
         input_sequence     = self.ts_continuous_projector(ts_continuous)
@@ -214,13 +207,6 @@ class CNN(nn.Module):
 
         # Tasks:
         **tasks_kwargs,
-        #rolling_fts = None,
-        #rolling_tasks_continuous = None,
-        #rolling_tasks_to_embed = None,
-        #static_tasks_continuous = None,
-        #static_tasks_to_embed = None,
-        #next_timepoint = None,
-        #next_timepoint_was_measured = None,
     ):
         # TODO(mmd): Embedding Features...
         input_sequence     = self.ts_continuous_projector(ts_continuous)
@@ -318,13 +304,6 @@ class GRUModel(nn.Module):
 
         # Tasks:
         **tasks_kwargs,
-        #rolling_fts = None,
-        #rolling_tasks_continuous = None,
-        #rolling_tasks_to_embed = None,
-        #static_tasks_continuous = None,
-        #static_tasks_to_embed = None,
-        #next_timepoint = None,
-        #next_timepoint_was_measured = None,
     ):
         # TODO(mmd): Embedding Features...
         input_sequence     = self.ts_continuous_projector(ts_continuous)

@@ -1,6 +1,6 @@
 # A Comprehensive EHR Timeseries Pre-training Benchmark
 Source code for our paper (link forthcoming) defining a pre-training benchmark system for EHR timeseries data.
-Contact `mmd@mit.edu` and `bretnestor@cs.toronto.edu ` with any questions.
+Contact mmd@mit.edu and bretnestor@cs.toronto.edu with any questions. Pending interest from the community, we're eager to make this as usable as possible, and will respond promptly to any issues or questions.
 
 # Install
 
@@ -27,8 +27,8 @@ It is a good reference to determine what a specific script expects. Note this cl
 recommend) pre-setting all args for scripts in (appropriately named) json files in the relevant experiment
 directories, then simply passing the directory to the given script (according to the appropriate `arg`) and
 adding `--do_load_from_dir`, at which point the script will load all arguments from the json file
-automatically. Note that some args (specifically `rotation`, which should always be 0, and `notes`, which
-should always be `no_notes`) are held-out args from older versions of the code, and can be largely ignored.
+automatically. Note that some args (specifically `regression_task_weight`, which should always be 0, `notes`, which
+should always be `no_notes`, and `task_weights_filepath`, which should always be `''`) are held-out args from older versions of the code, and can be largely ignored. Similarly, the modeltype specific args corresponding to CNN, Self-attention, or Linear projection models are also no longer used. Some sample args for different settings are given in `Sample Args`. Please raise a github issue or contact mmd@mit.edu or bretnestor@cs.toronto.edu with any questions.
 
 ## Hyperparameter Tuning
 To perform hyperparameter tuning, set up a base experimental directory, and add a config file describing your

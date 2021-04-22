@@ -50,6 +50,13 @@ Evaluating a pre-trained run can be accomplished with the `EvalArgs` class and t
 will need to specify the model's training directory (e.g., the directory passed to `run_model.py`) so the
 script knows what model to reload.
 
+To convert evaluation results into a form that is human readable and aggregated across tasks, use the `get_manuscript_metrics*` functions (e.g., https://github.com/mmcdermott/comprehensive_MTL_EHR/blob/master/latent_patient_trajectories/representation_learner/evaluator.py#L41) on the output dictionaries. This function just re-processes the more granular output of `evaluate.py` into a more readable form.
+
+To see an example of where that function is called you can look within the hyperparameter tuning code here:https://github.com/mmcdermott/comprehensive_MTL_EHR/blob/master/latent_patient_trajectories/representation_learner/hyperparameter_search.py#L724
+then here:https://github.com/mmcdermott/comprehensive_MTL_EHR/blob/master/latent_patient_trajectories/representation_learner/hyperparameter_search.py#L664
+
+That code bit shows where the output from the evaluator main function can be parsed into the expected input to the `get_manuscript_metrics_via_args` function. 
+
 ## Task-Generalizability Analyses
 These runs consist of pre-training a model either via masked imputation or via multi-task pre-training, in
 which the model is pre-trained on all tasks except for one held-out task, then fine-tuning the

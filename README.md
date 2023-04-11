@@ -1,5 +1,5 @@
 # A Comprehensive EHR Timeseries Pre-training Benchmark
-Source code for our paper (link forthcoming) defining a pre-training benchmark system for EHR timeseries data.
+Source code for our paper (https://dl.acm.org/doi/pdf/10.1145/3450439.3451877) defining a pre-training benchmark system for EHR timeseries data.
 Contact mmd@mit.edu and bretnestor@cs.toronto.edu with any questions. Pending interest from the community, we're eager to make this as usable as possible, and will respond promptly to any issues or questions.
 
 # Install
